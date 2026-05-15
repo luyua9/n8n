@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { sanitizeInputSchema } from '../agent/sanitize-mcp-schemas';
 import type { InstanceAiContext } from '../types';
 import { formatTimestamp } from '../utils/format-timestamp';
+import { detectAiNodes } from './evals/detect-ai-nodes';
 import { setupSuspendSchema, setupResumeSchema } from './workflows/setup-workflow.schema';
 import {
 	analyzeWorkflow,
@@ -63,6 +64,20 @@ const setupAction = z.object({
 		.describe('Open the workflow setup UI for credential and parameter configuration'),
 	workflowId: z.string().describe('ID of the workflow'),
 	projectId: z.string().optional().describe('Project ID to scope credential creation to'),
+});
+
+const updateAction = z.object({
+	action: z
+		.literal('update')
+		.describe(
+			'Save a complete modified WorkflowJSON back to the workflow. Use after reading via `get` and modifying the JSON. Replaces the full workflow definition.',
+		),
+	workflowId: z.string().describe('ID of the workflow'),
+	workflow: z
+		.record(z.unknown())
+		.describe(
+			'Full WorkflowJSON object (same shape as returned by `get`). This completely replaces the current workflow definition — ensure name, nodes, and connections are all included.',
+		),
 });
 
 const publishBaseAction = z.object({
@@ -141,6 +156,7 @@ type Input =
 	| z.infer<typeof deleteAction>
 	| z.infer<typeof unarchiveAction>
 	| z.infer<typeof setupAction>
+	| z.infer<typeof updateAction>
 	| z.infer<typeof publishExtendedAction>
 	| z.infer<typeof unpublishAction>
 	| z.infer<typeof listVersionsAction>
@@ -160,6 +176,7 @@ export type WorkflowAction =
 	| 'delete'
 	| 'unarchive'
 	| 'setup'
+	| 'update'
 	| 'publish'
 	| 'unpublish'
 	| 'list-versions'
@@ -185,6 +202,7 @@ const WORKFLOW_ACTION_ORDER = [
 	'delete',
 	'unarchive',
 	'setup',
+	'update',
 	'publish',
 	'unpublish',
 	'list-versions',
@@ -200,6 +218,7 @@ const WORKFLOW_ACTION_LABELS = {
 	delete: 'archive',
 	unarchive: 'restore archived workflows',
 	setup: 'set up credentials and parameters',
+	update: 'save a modified WorkflowJSON',
 	publish: 'publish',
 	unpublish: 'unpublish',
 	'list-versions': 'list versions',
@@ -226,6 +245,7 @@ function getSupportedWorkflowActionSchemas(
 		delete: deleteAction,
 		unarchive: unarchiveAction,
 		setup: setupAction,
+		update: updateAction,
 		publish: hasNamedVersions ? publishExtendedAction : publishBaseAction,
 		unpublish: unpublishAction,
 		...(hasVersions
@@ -645,6 +665,8 @@ async function handlePublish(
 			});
 			publishedWorkflowIds.push(input.workflowId);
 
+			const evalRunReminder = await maybeBuildEvalRunReminder(context, input.workflowId);
+
 			return {
 				success: true,
 				activeVersionId: result.activeVersionId,
@@ -652,6 +674,7 @@ async function handlePublish(
 				...(publishedSupportingWorkflowIds.length > 0
 					? { supportingWorkflowIds: publishedSupportingWorkflowIds }
 					: {}),
+				...(evalRunReminder ? { evalRunReminder } : {}),
 			};
 		} catch (error) {
 			const rollback = await rollbackPublishedWorkflows(
@@ -666,6 +689,46 @@ async function handlePublish(
 			success: false,
 			error: error instanceof Error ? error.message : 'Publish failed',
 		};
+	}
+}
+
+/**
+ * If the workflow has eval setup wired (EvaluationTrigger / Evaluation nodes),
+ * return a directive nudging the agent to suggest running the evals after
+ * publish. Mirrors the pattern used by `executions(action="run")`'s
+ * evalOfferGate: it surfaces the reminder in the tool result, where the LLM
+ * sees it at decision time rather than buried in the system-prompt.
+ *
+ * Returns `undefined` when the workflow has no eval setup or when the lookup
+ * fails — the publish operation itself already succeeded; a missing reminder
+ * is a UX nudge gap, not a correctness bug.
+ */
+async function maybeBuildEvalRunReminder(
+	context: InstanceAiContext,
+	workflowId: string,
+): Promise<
+	| {
+			required: true;
+			workflowId: string;
+			instruction: string;
+	  }
+	| undefined
+> {
+	try {
+		const workflow = await context.workflowService.getAsWorkflowJSON(workflowId);
+		const detection = detectAiNodes(workflow);
+		if (!detection.alreadyConfigured) return undefined;
+		return {
+			required: true,
+			workflowId,
+			instruction:
+				'POST-PUBLISH EVAL RUN REMINDER: This workflow has an eval suite wired. ' +
+				'Before ending the turn, briefly suggest the user run the evals to confirm the published changes still pass. ' +
+				`A one-liner is enough: e.g. "Want me to run the evals against ${workflowId} to make sure the update didn't regress anything?" ` +
+				'Do NOT auto-run them — just offer.',
+		};
+	} catch {
+		return undefined;
 	}
 }
 
@@ -912,6 +975,48 @@ function getToolDescription(context: InstanceAiContext, options: WorkflowsToolOp
 	return suffix ? `${description} ${suffix}` : description;
 }
 
+async function handleUpdate(
+	context: InstanceAiContext,
+	input: Extract<Input, { action: 'update' }>,
+	ctx: WorkflowToolContext,
+) {
+	const resumeData = ctx.resumeData;
+
+	if (context.permissions?.updateWorkflow === 'blocked') {
+		return { success: false, denied: true, reason: 'Action blocked by admin' };
+	}
+
+	const needsApproval = context.permissions?.updateWorkflow !== 'always_allow';
+
+	if (needsApproval && (resumeData === undefined || resumeData === null)) {
+		const workflowName = await resolveWorkflowName(context, input.workflowId);
+		return await ctx.suspend({
+			requestId: nanoid(),
+			message: `Update workflow "${workflowName}" (ID: ${input.workflowId})?`,
+			severity: 'warning' as const,
+		});
+	}
+
+	if (resumeData !== undefined && resumeData !== null && !resumeData.approved) {
+		return { success: false, denied: true, reason: 'User denied the action' };
+	}
+
+	try {
+		await context.workflowService.updateFromWorkflowJSON(
+			input.workflowId,
+			input.workflow as unknown as Parameters<
+				typeof context.workflowService.updateFromWorkflowJSON
+			>[1],
+		);
+		return { success: true, workflowId: input.workflowId };
+	} catch (error) {
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
 // ── Tool factory ────────────────────────────────────────────────────────────
 
 export function createWorkflowsTool(
@@ -947,6 +1052,8 @@ export function createWorkflowsTool(
 					return await handleUnarchive(context, workflowInput, ctx);
 				case 'setup':
 					return await handleSetup(context, workflowInput, ctx, setupState);
+				case 'update':
+					return await handleUpdate(context, workflowInput, ctx);
 				case 'publish':
 					return await handlePublish(context, workflowInput, ctx);
 				case 'unpublish':
