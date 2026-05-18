@@ -6,12 +6,13 @@ import { z } from 'zod';
 
 import { analyzeAgentInputColumns } from './analyze-agent-input-columns.service';
 import { applyPinData } from './apply-pin-data.service';
+import { isRecord } from './column-ref-utils';
 import {
 	describeMetricForWorkflow,
 	recommendedMetricId,
 } from './describe-metric-for-workflow.service';
 import { detectAgentNamedRefs, type NamedRef } from './detect-agent-named-refs.service';
-import { detectAiNodes } from './detect-ai-nodes';
+import { detectAiNodes, type DetectAiNodesResult } from './detect-ai-nodes';
 import { detectToolRefs } from './detect-tool-refs.service';
 import { createEmptyEvalDataTable } from './ensure-eval-data-table.service';
 import { analyzeEvalDataRequirements } from './eval-data-requirements.service';
@@ -37,6 +38,10 @@ const offerAction = z.object({
 		),
 	workflowId: z.string(),
 	projectId: z.string().optional(),
+	targetAgentNodeName: z
+		.string()
+		.optional()
+		.describe('Required when the workflow has more than one AI node.'),
 });
 
 const recommendMetricAction = z.object({
@@ -46,6 +51,10 @@ const recommendMetricAction = z.object({
 			'Opinionated single-metric suggestion. Suspends with an approve/deny widget showing the workflow-specific recommended metric. On approval returns `{ approved: true, metricId }` — pass that single id to `propose` and skip `select-metrics`. On denial returns `{ approved: false }` — fall through to `select-metrics` so the user can pick from the full list.',
 		),
 	workflowId: z.string(),
+	targetAgentNodeName: z
+		.string()
+		.optional()
+		.describe('Required when the workflow has more than one AI node.'),
 });
 
 const selectMetricsAction = z.object({
@@ -55,6 +64,10 @@ const selectMetricsAction = z.object({
 			'Multi-select picker over all canned metrics — call this ONLY when `recommend-metric` returned `{ approved: false }`. Returns chosenMetricIds.',
 		),
 	workflowId: z.string(),
+	targetAgentNodeName: z
+		.string()
+		.optional()
+		.describe('Required when the workflow has more than one AI node.'),
 });
 
 const proposeAction = z.object({
@@ -68,6 +81,10 @@ const proposeAction = z.object({
 	metrics: z.array(z.string()).default([]),
 	datasetChoice: z.enum(['create-empty', 'link-existing', 'later']).default('create-empty'),
 	existingDataTableId: z.string().optional(),
+	targetAgentNodeName: z
+		.string()
+		.optional()
+		.describe('Required when the workflow has more than one AI node.'),
 });
 
 const offerDataPopulationAction = z.object({
@@ -241,6 +258,75 @@ function metricLabel(
 		: `${name}${recommendedSuffix}`;
 }
 
+type TargetAgentResolution =
+	| { ok: true; agentName: string }
+	| {
+			ok: false;
+			reason: 'target-agent-required' | 'target-agent-not-found';
+			aiNodeNames: string[];
+			message: string;
+	  };
+
+function composeTargetAgentMessage(
+	aiNodeNames: string[],
+	targetAgentNodeName: string | undefined,
+): string {
+	const list = aiNodeNames.map((name) => `\`${name}\``).join(', ');
+	if (targetAgentNodeName) {
+		return `I couldn't find AI node \`${targetAgentNodeName}\`. Pick one of these AI nodes to set up evals for: ${list}.`;
+	}
+	return `This workflow has multiple AI nodes: ${list}. Which AI node should I set up evals for?`;
+}
+
+function resolveTargetAgent(
+	detection: DetectAiNodesResult,
+	targetAgentNodeName: string | undefined,
+): TargetAgentResolution {
+	if (targetAgentNodeName) {
+		if (detection.aiNodeNames.includes(targetAgentNodeName)) {
+			return { ok: true, agentName: targetAgentNodeName };
+		}
+		return {
+			ok: false,
+			reason: 'target-agent-not-found',
+			aiNodeNames: detection.aiNodeNames,
+			message: composeTargetAgentMessage(detection.aiNodeNames, targetAgentNodeName),
+		};
+	}
+
+	const [onlyAgentName] = detection.aiNodeNames;
+	if (detection.aiNodeNames.length === 1 && onlyAgentName) {
+		return { ok: true, agentName: onlyAgentName };
+	}
+
+	return {
+		ok: false,
+		reason: 'target-agent-required',
+		aiNodeNames: detection.aiNodeNames,
+		message: composeTargetAgentMessage(detection.aiNodeNames, undefined),
+	};
+}
+
+function targetAgentSkippedResponse(resolution: Exclude<TargetAgentResolution, { ok: true }>) {
+	return {
+		skipped: true as const,
+		reason: resolution.reason,
+		aiNodeNames: resolution.aiNodeNames,
+		message: resolution.message,
+	};
+}
+
+function pinDataCoversRef(pinData: WorkflowJSON['pinData'] | undefined, ref: NamedRef): boolean {
+	const items = pinData?.[ref.nodeName];
+	if (!items) return false;
+
+	return items.some((item) => {
+		const json = item.json;
+		if (isRecord(json)) return Object.hasOwn(json, ref.field);
+		return Object.hasOwn(item, ref.field);
+	});
+}
+
 // ── Tool factory ───────────────────────────────────────────────────────────
 
 export function createEvalsTool(context: InstanceAiContext) {
@@ -283,12 +369,24 @@ async function executeOffer(context: InstanceAiContext, input: z.infer<typeof of
 		return { eligible: false as const, reason: 'already-configured' as const };
 	}
 
-	const agentName = detection.aiNodeNames[0];
+	const target = resolveTargetAgent(detection, input.targetAgentNodeName);
+	if (!target.ok) {
+		return {
+			eligible: true as const,
+			requiresTargetAgentSelection: true as const,
+			reason: target.reason,
+			aiNodeNames: target.aiNodeNames,
+			message: target.message,
+		};
+	}
+
+	const agentName = target.agentName;
 	const namedRefs = detectAgentNamedRefs(wf, agentName);
 
 	return {
 		eligible: true as const,
 		aiNodeNames: detection.aiNodeNames,
+		targetAgentNodeName: agentName,
 		message: composeOfferMessage(detection.aiNodeNames, namedRefs),
 	};
 }
@@ -323,7 +421,10 @@ async function executeRecommendMetric(
 		return { skipped: true as const, reason: 'no-ai-nodes' as const };
 	}
 
-	const agentName = detection.aiNodeNames[0];
+	const target = resolveTargetAgent(detection, input.targetAgentNodeName);
+	if (!target.ok) return targetAgentSkippedResponse(target);
+
+	const agentName = target.agentName;
 	const metricId = recommendedMetricId(wf, agentName);
 
 	if (hasResumeData(ctx)) {
@@ -359,7 +460,10 @@ async function executeSelectMetrics(
 		return { skipped: true as const, reason: 'no-ai-nodes' as const };
 	}
 
-	const agentName = detection.aiNodeNames[0];
+	const target = resolveTargetAgent(detection, input.targetAgentNodeName);
+	if (!target.ok) return targetAgentSkippedResponse(target);
+
+	const agentName = target.agentName;
 
 	if (hasResumeData(ctx)) {
 		if (resumeData === undefined || !resumeData.approved || !resumeData.answers) {
@@ -413,7 +517,17 @@ async function executePropose(context: InstanceAiContext, input: z.infer<typeof 
 		};
 	}
 
-	const agentName = detection.aiNodeNames[0];
+	const target = resolveTargetAgent(detection, input.targetAgentNodeName);
+	if (!target.ok) return targetAgentSkippedResponse(target);
+
+	// datasetChoice may be undefined when sanitizeInputSchema flattens the
+	// discriminated union — treat missing value as the schema default ('create-empty').
+	const datasetChoice = input.datasetChoice ?? 'create-empty';
+	if (datasetChoice === 'link-existing' && !input.existingDataTableId) {
+		return { skipped: true as const, reason: 'existing-data-table-id-required' as const };
+	}
+
+	const agentName = target.agentName;
 	const { inputColumns: directColumns } = analyzeAgentInputColumns(wf, agentName);
 	const namedRefs = detectAgentNamedRefs(wf, agentName);
 
@@ -422,7 +536,7 @@ async function executePropose(context: InstanceAiContext, input: z.infer<typeof 
 	// workflow JSON. This shadows the production-adapter rewrite for those
 	// refs, so they're subtracted from `namedRefs` before formatting the task.
 	const toolRefs = detectToolRefs(wf, agentName);
-	let pinDataCoveredSources = new Set<string>();
+	let workflowWithPinData = wf;
 	if (toolRefs.length > 0) {
 		const generated = await generateToolRefPinData({
 			workflow: wf,
@@ -434,11 +548,11 @@ async function executePropose(context: InstanceAiContext, input: z.infer<typeof 
 			await context.workflowService.updateFromWorkflowJSON(input.workflowId, patched, {
 				...(input.projectId ? { projectId: input.projectId } : {}),
 			});
-			pinDataCoveredSources = new Set(Object.keys(generated));
+			workflowWithPinData = patched;
 		}
 	}
 	const filteredNamedRefs = namedRefs.filter(
-		(r) => !(r.targetNodeName !== agentName && pinDataCoveredSources.has(r.nodeName)),
+		(r) => !(r.targetNodeName !== agentName && pinDataCoversRef(workflowWithPinData.pinData, r)),
 	);
 	const namedRefColumns = filteredNamedRefs.map((r) => r.column);
 
@@ -458,10 +572,6 @@ async function executePropose(context: InstanceAiContext, input: z.infer<typeof 
 	let dataTableId: string | undefined = input.existingDataTableId;
 	let createdTable: { id: string; name: string; projectId?: string } | undefined;
 	let datasetChoiceForTask: 'link-existing' | 'later' = 'later';
-
-	// datasetChoice may be undefined when sanitizeInputSchema flattens the
-	// discriminated union — treat missing value as the schema default ('create-empty').
-	const datasetChoice = input.datasetChoice ?? 'create-empty';
 
 	if (datasetChoice === 'link-existing' && input.existingDataTableId) {
 		datasetChoiceForTask = 'link-existing';
@@ -487,6 +597,7 @@ async function executePropose(context: InstanceAiContext, input: z.infer<typeof 
 		suggestedOutputColumns: outputColumns,
 		enabledMetrics: resolvedMetrics,
 		namedRefs: filteredNamedRefs,
+		targetAgentNodeName: agentName,
 	});
 
 	return {

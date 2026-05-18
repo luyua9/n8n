@@ -1,3 +1,4 @@
+import { currentJsonExpression, nodeItemJsonExpression } from '../column-ref-utils';
 import { formatEvalSetupTask } from '../format-eval-setup-task';
 
 const BASE = {
@@ -104,10 +105,45 @@ describe('formatEvalSetupTask — PRODUCTION ADAPTER section', () => {
 				},
 			],
 		});
-		expect(task).toMatch(
-			/Replace `\$\('Sender ID'\)\.item\.json\.id` with `\{\{ \$\('Chef Agent'\)\.item\.json\.sender_id \}\}`/,
+		expect(task).toContain(
+			`Replace \`$('Sender ID').item.json.id\` with \`{{ ${nodeItemJsonExpression('Chef Agent', 'sender_id')} }}\``,
 		);
 		// Sub-component must not fall back to plain $json.<col>
 		expect(task).not.toMatch(/In `Postgres Memory`:[\s\S]*\{\{ \$json\.sender_id \}\}/);
+	});
+
+	it('escapes generated adapter assignments and rewrite expressions', () => {
+		const sourceNodeName = 'Voice "or" Text';
+		const sourceField = 'message-id';
+		const agentNodeName = "Chef's Agent";
+		const column = 'user-message';
+		const task = formatEvalSetupTask({
+			...BASE,
+			detectedAiNodes: ['Other Agent', agentNodeName],
+			targetAgentNodeName: agentNodeName,
+			suggestedInputColumns: [column],
+			namedRefs: [
+				{
+					nodeName: sourceNodeName,
+					field: sourceField,
+					originalExpression: '$("Voice \\"or\\" Text").item.json["message-id"]',
+					column,
+					targetNodeName: agentNodeName,
+				},
+				{
+					nodeName: 'Sender',
+					field: 'sender-id',
+					originalExpression: '$("Sender").item.json["sender-id"]',
+					column: 'sender-id',
+					targetNodeName: 'Postgres Memory',
+				},
+			],
+		});
+
+		expect(task).toContain(
+			`value: ${JSON.stringify(`={{ ${nodeItemJsonExpression(sourceNodeName, sourceField)} }}`)}`,
+		);
+		expect(task).toContain(`with \`{{ ${currentJsonExpression(column)} }}\``);
+		expect(task).toContain(`with \`{{ ${nodeItemJsonExpression(agentNodeName, 'sender-id')} }}\``);
 	});
 });

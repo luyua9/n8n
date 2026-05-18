@@ -185,6 +185,31 @@ function aiWfWithDirectAndNamedRef(): WorkflowJSON {
 	} as unknown as WorkflowJSON;
 }
 
+function aiWfWithMultipleAgents(): WorkflowJSON {
+	return {
+		name: 'Multi AI Flow',
+		nodes: [
+			{
+				id: '1',
+				name: 'First Agent',
+				type: '@n8n/n8n-nodes-langchain.agent',
+				typeVersion: 1,
+				position: [0, 0],
+				parameters: { text: '={{ $json.first_input }}' },
+			},
+			{
+				id: '2',
+				name: 'Second Agent',
+				type: '@n8n/n8n-nodes-langchain.agent',
+				typeVersion: 1,
+				position: [200, 0],
+				parameters: { text: '={{ $json.second_input }}' },
+			},
+		],
+		connections: {},
+	} as unknown as WorkflowJSON;
+}
+
 function makeCtx(
 	wf: WorkflowJSON,
 	dataTableOverrides?: Partial<InstanceAiContext['dataTableService']>,
@@ -283,6 +308,22 @@ describe('evalsTool — action: offer (eligibility precheck + chat message)', ()
 			aiNodeNames: ['Agent'],
 		});
 		expect(result.message).toEqual(expect.stringMatching(/test cases/i));
+	});
+
+	it('asks for a target agent when the workflow has multiple AI nodes', async () => {
+		const ctx = makeCtx(aiWfWithMultipleAgents());
+		const tool = createEvalsTool(ctx);
+
+		const result = (await tool.handler!({ action: 'offer', workflowId: 'w1' }, {
+			agent: { resumeData: undefined },
+		} as never)) as Record<string, unknown>;
+
+		expect(result).toMatchObject({
+			eligible: true,
+			requiresTargetAgentSelection: true,
+			aiNodeNames: ['First Agent', 'Second Agent'],
+		});
+		expect(result.message).toEqual(expect.stringMatching(/which AI node/i));
 	});
 });
 
@@ -678,6 +719,64 @@ describe('evals tool — propose action (changed)', () => {
 		const task = result.task as string;
 		expect(task).toContain('Do not create a DataTable');
 	});
+
+	it('rejects datasetChoice="link-existing" when existingDataTableId is missing', async () => {
+		const ctx = makeCtx(aiWf());
+		const tool = createEvalsTool(ctx);
+
+		const result = (await tool.handler!(
+			{ action: 'propose', workflowId: 'w1', datasetChoice: 'link-existing' },
+			{ agent: {} } as never,
+		)) as Record<string, unknown>;
+
+		expect(ctx.dataTableService.create).not.toHaveBeenCalled();
+		expect(result).toEqual({
+			skipped: true,
+			reason: 'existing-data-table-id-required',
+		});
+	});
+
+	it('requires targetAgentNodeName when proposing evals for a multi-agent workflow', async () => {
+		const ctx = makeCtx(aiWfWithMultipleAgents());
+		const tool = createEvalsTool(ctx);
+
+		const result = (await tool.handler!({ action: 'propose', workflowId: 'w1' }, {
+			agent: {},
+		} as never)) as Record<string, unknown>;
+
+		expect(ctx.dataTableService.create).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			skipped: true,
+			reason: 'target-agent-required',
+			aiNodeNames: ['First Agent', 'Second Agent'],
+		});
+	});
+
+	it('uses targetAgentNodeName to analyze the selected agent in a multi-agent workflow', async () => {
+		const ctx = makeCtx(aiWfWithMultipleAgents());
+		const tool = createEvalsTool(ctx);
+
+		await tool.handler!(
+			{
+				action: 'propose',
+				workflowId: 'w1',
+				targetAgentNodeName: 'Second Agent',
+				metrics: ['correctness'],
+			},
+			{ agent: {} } as never,
+		);
+
+		expect(ctx.dataTableService.create).toHaveBeenCalledWith(
+			expect.any(String) as unknown,
+			expect.arrayContaining([{ name: 'second_input', type: 'string' }]) as unknown,
+			undefined,
+		);
+		expect(ctx.dataTableService.create).not.toHaveBeenCalledWith(
+			expect.any(String) as unknown,
+			expect.arrayContaining([{ name: 'first_input', type: 'string' }]) as unknown,
+			undefined,
+		);
+	});
 });
 
 // ── action: offer-data-population ──────────────────────────────────────────
@@ -832,6 +931,44 @@ function aiWfWithToolRef(): WorkflowJSON {
 	} as unknown as WorkflowJSON;
 }
 
+function aiWfWithTwoToolRefs(): WorkflowJSON {
+	return {
+		name: 'AI Flow',
+		nodes: [
+			{
+				id: 't',
+				name: 'Telegram Trigger',
+				type: 'n8n-nodes-base.telegramTrigger',
+				typeVersion: 1,
+				position: [0, 0],
+				parameters: { updates: ['message'] },
+			},
+			{
+				id: 'a',
+				name: 'Agent',
+				type: '@n8n/n8n-nodes-langchain.agent',
+				typeVersion: 1,
+				position: [200, 0],
+				parameters: { text: '={{ $json.user_query }}' },
+			},
+			{
+				id: 'm',
+				name: 'Postgres Memory',
+				type: '@n8n/n8n-nodes-langchain.memoryPostgres',
+				typeVersion: 1,
+				position: [200, 200],
+				parameters: {
+					sessionIdExpression: "={{ $('Telegram Trigger').item.json.chat_id }}",
+					tableName: "={{ $('Telegram Trigger').item.json.sender_id }}",
+				},
+			},
+		],
+		connections: {
+			'Postgres Memory': { ai_memory: [[{ node: 'Agent', type: 'ai_memory', index: 0 }]] },
+		},
+	} as unknown as WorkflowJSON;
+}
+
 describe('evals tool — propose with tool-ref pinData', () => {
 	beforeEach(() => {
 		jest.clearAllMocks();
@@ -883,6 +1020,30 @@ describe('evals tool — propose with tool-ref pinData', () => {
 		expect(create).toHaveBeenCalledWith(
 			expect.any(String) as unknown,
 			expect.arrayContaining([{ name: 'user_query', type: 'string' }]) as unknown,
+			undefined,
+		);
+	});
+
+	it('keeps sub-component refs in the dataset when generated pinData is missing that field', async () => {
+		mockGenerateToolRefPinData.mockResolvedValue({
+			'Telegram Trigger': [{ json: { chat_id: '42' } }],
+		});
+		const create = jest.fn().mockResolvedValue({ id: 'dt-1', name: 'x', columns: [] });
+		const ctx = makeCtx(aiWfWithTwoToolRefs(), { create });
+		const tool = createEvalsTool(ctx);
+
+		await tool.handler!({ action: 'propose', workflowId: 'w1', metrics: ['correctness'] }, {
+			agent: {},
+		} as never);
+
+		expect(create).toHaveBeenCalledWith(
+			expect.any(String) as unknown,
+			expect.arrayContaining([{ name: 'sender_id', type: 'string' }]) as unknown,
+			undefined,
+		);
+		expect(create).not.toHaveBeenCalledWith(
+			expect.any(String) as unknown,
+			expect.arrayContaining([{ name: 'chat_id', type: 'string' }]) as unknown,
 			undefined,
 		);
 	});

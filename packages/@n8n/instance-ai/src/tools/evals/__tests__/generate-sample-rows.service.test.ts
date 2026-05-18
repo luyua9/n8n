@@ -83,6 +83,30 @@ describe('generateSampleRows', () => {
 		});
 		expect(rows).toEqual([{ input: '', expected_output: '' }]);
 	});
+
+	it('returns [] when requested rowCount is zero', async () => {
+		const generate = jest.fn();
+		mockCreateEvalAgent.mockReturnValue({ generate } as unknown as ReturnType<
+			typeof createEvalAgent
+		>);
+		const rows = await generateSampleRows({
+			workflow: WF,
+			columns: ['input'],
+			rowCount: 0,
+		});
+		expect(rows).toEqual([]);
+		expect(generate).not.toHaveBeenCalled();
+	});
+
+	it('clamps merged rows when batches return more than requested', async () => {
+		setupAgentMock(JSON.stringify([{ input: 'a' }, { input: 'b' }]));
+		const rows = await generateSampleRows({
+			workflow: WF,
+			columns: ['input'],
+			rowCount: 3,
+		});
+		expect(rows).toHaveLength(3);
+	});
 });
 
 describe('distributeRowCount', () => {

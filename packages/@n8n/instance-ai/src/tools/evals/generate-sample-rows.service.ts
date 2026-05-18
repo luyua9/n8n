@@ -237,7 +237,9 @@ function emptyRow(columns: string[]): Record<string, string> {
 export async function generateSampleRows(
 	input: GenerateSampleRowsInput,
 ): Promise<Array<Record<string, string>>> {
-	const rowCount = input.rowCount ?? DEFAULT_ROW_COUNT;
+	const rowCount = Math.max(0, Math.floor(input.rowCount ?? DEFAULT_ROW_COUNT));
+	if (rowCount === 0) return [];
+
 	const counts = distributeRowCount(rowCount);
 	const context = resolveAgentContext(input.workflow, input.targetAgentNodeName);
 
@@ -254,5 +256,5 @@ export async function generateSampleRows(
 		if (r.status === 'fulfilled') merged.push(...r.value);
 	}
 	if (merged.length === 0) return [emptyRow(input.columns)];
-	return merged;
+	return merged.slice(0, rowCount);
 }

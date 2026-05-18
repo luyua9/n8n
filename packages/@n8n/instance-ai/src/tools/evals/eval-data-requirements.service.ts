@@ -3,6 +3,7 @@ import type { WorkflowJSON } from '@n8n/workflow-sdk';
 import { analyzeAgentInputColumns } from './analyze-agent-input-columns.service';
 import {
 	extractJsonColumnRefs,
+	extractNamedRefMatches,
 	isRecord,
 	nodeHasName,
 	nodeTypeEndsWith,
@@ -93,6 +94,13 @@ function isAiAgentNode(node: WorkflowNode | undefined): boolean {
 	return Boolean(node?.type.includes('n8n-nodes-langchain.agent'));
 }
 
+function extractEvalTriggerColumnRefs(text: string): string[] {
+	return unique([
+		...extractJsonColumnRefs(text),
+		...extractNamedRefMatches(text).map((match) => match.field),
+	]);
+}
+
 function expectedColumnsFromMetricNodes(nodes: WorkflowNode[]): string[] {
 	return unique(
 		nodes.flatMap((node) => {
@@ -100,7 +108,7 @@ function expectedColumnsFromMetricNodes(nodes: WorkflowNode[]): string[] {
 			const parameters = node.parameters;
 			if (!isRecord(parameters)) return [];
 			const expectedRaw = parameters.expectedAnswer;
-			return typeof expectedRaw === 'string' ? extractJsonColumnRefs(expectedRaw) : [];
+			return typeof expectedRaw === 'string' ? extractEvalTriggerColumnRefs(expectedRaw) : [];
 		}),
 	);
 }
@@ -135,7 +143,7 @@ function pairsFromMetricNodes(
 		const expectedRaw = parameters.expectedAnswer;
 		const actualRaw = parameters.actualAnswer;
 		if (typeof expectedRaw !== 'string' || typeof actualRaw !== 'string') continue;
-		const expectedRefs = extractJsonColumnRefs(expectedRaw).filter((ref) =>
+		const expectedRefs = extractEvalTriggerColumnRefs(expectedRaw).filter((ref) =>
 			ref.startsWith('expected'),
 		);
 		const actualRefs = extractJsonColumnRefs(actualRaw);
